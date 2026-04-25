@@ -22,7 +22,7 @@ export default defineConfig(({ command }) => {
 
   return {
     plugins: [react()],
-    base: './gpt-image-playground/',
+    base: '/gpt_image_playground/',
     define: {
       __APP_VERSION__: JSON.stringify(pkg.version),
       __DEV_PROXY_CONFIG__: JSON.stringify(devProxyConfig),
