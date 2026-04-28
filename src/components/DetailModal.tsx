@@ -1,20 +1,28 @@
 import { useEffect, useState, useMemo, useRef } from 'react'
-import { useStore, getCachedImage, ensureImageCached, reuseConfig, editOutputs, removeTask } from '../store'
+import { useStore, getCachedImage, ensureImageCached, reuseConfig, editOutputs, removeTask, updateTaskInStore, showCodexCliPrompt, getCodexCliPromptKey } from '../store'
 import { useCloseOnEscape } from '../hooks/useCloseOnEscape'
 import { formatImageRatio } from '../lib/size'
+import { ActualValueBadge, DetailParamValue } from '../lib/paramDisplay'
+import { copyBlobToClipboard, copyTextToClipboard, getClipboardFailureMessage } from '../lib/clipboard'
+import { createMaskPreviewDataUrl } from '../lib/canvasImage'
 
 export default function DetailModal() {
   const tasks = useStore((s) => s.tasks)
   const detailTaskId = useStore((s) => s.detailTaskId)
   const setDetailTaskId = useStore((s) => s.setDetailTaskId)
   const setLightboxImageId = useStore((s) => s.setLightboxImageId)
+  const setMaskEditorImageId = useStore((s) => s.setMaskEditorImageId)
   const setConfirmDialog = useStore((s) => s.setConfirmDialog)
   const showToast = useStore((s) => s.showToast)
+  const settings = useStore((s) => s.settings)
+  const dismissedCodexCliPrompts = useStore((s) => s.dismissedCodexCliPrompts)
 
   const [imageIndex, setImageIndex] = useState(0)
   const [imageSrcs, setImageSrcs] = useState<Record<string, string>>({})
   const [imageRatios, setImageRatios] = useState<Record<string, string>>({})
   const [imageSizes, setImageSizes] = useState<Record<string, string>>({})
+  const [maskPreviewSrc, setMaskPreviewSrc] = useState('')
+  const [now, setNow] = useState(Date.now())
   const imagePanelRef = useRef<HTMLDivElement>(null)
   const mainImageRef = useRef<HTMLImageElement>(null)
   const [imageLabelLeft, setImageLabelLeft] = useState(8)
@@ -31,24 +39,49 @@ export default function DetailModal() {
     setImageIndex(0)
   }, [detailTaskId])
 
+  useEffect(() => {
+    if (task?.status !== 'running') return
+    const id = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(id)
+  }, [task?.status])
+
   // 加载所有相关图片
   useEffect(() => {
-    if (!task) return
-    const ids = [...(task.outputImages || []), ...(task.inputImageIds || [])]
+    if (!task) {
+      setImageSrcs({})
+      return
+    }
+
+    let cancelled = false
+    const ids = [...new Set([
+      ...(task.outputImages || []),
+      ...(task.inputImageIds || []),
+      ...(task.maskImageId ? [task.maskImageId] : []),
+    ])]
+    const initial: Record<string, string> = {}
     for (const id of ids) {
       const cached = getCachedImage(id)
-      if (cached) {
-        setImageSrcs((prev) => ({ ...prev, [id]: cached }))
-      } else {
-        ensureImageCached(id).then((url) => {
-          if (url) setImageSrcs((prev) => ({ ...prev, [id]: url }))
-        })
-      }
+      if (cached) initial[id] = cached
+    }
+    setImageSrcs(initial)
+    for (const id of ids) {
+      if (initial[id]) continue
+      ensureImageCached(id).then((url) => {
+        if (!cancelled && url) setImageSrcs((prev) => ({ ...prev, [id]: url }))
+      })
+    }
+
+    return () => {
+      cancelled = true
     }
   }, [task])
 
   const currentOutputImageId = task?.outputImages?.[imageIndex] || ''
   const currentOutputImageSrc = currentOutputImageId ? imageSrcs[currentOutputImageId] || '' : ''
+  const maskTargetId = task?.maskTargetImageId || null
+  const maskTargetSrc = maskTargetId ? imageSrcs[maskTargetId] || '' : ''
+  const maskSrc = task?.maskImageId ? imageSrcs[task.maskImageId] || '' : ''
+  const allInputImageIds = task?.inputImageIds ?? []
 
   useEffect(() => {
     if (!currentOutputImageId || !currentOutputImageSrc) return
@@ -100,11 +133,36 @@ export default function DetailModal() {
     return () => window.removeEventListener('resize', updateImageLabelLeft)
   }, [currentOutputImageSrc])
 
+  useEffect(() => {
+    let cancelled = false
+    setMaskPreviewSrc('')
+    if (!maskTargetSrc || !maskSrc) return
+
+    createMaskPreviewDataUrl(maskTargetSrc, maskSrc)
+      .then((url) => {
+        if (!cancelled) setMaskPreviewSrc(url)
+      })
+      .catch(() => {
+        if (!cancelled) setMaskPreviewSrc('')
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [maskTargetSrc, maskSrc])
+
   if (!task) return null
 
   const outputLen = task.outputImages?.length || 0
   const currentImageRatio = currentOutputImageId ? imageRatios[currentOutputImageId] : ''
   const currentImageSize = currentOutputImageId ? imageSizes[currentOutputImageId] : ''
+  const currentActualParams = currentOutputImageId ? task.actualParamsByImage?.[currentOutputImageId] : undefined
+  const currentRevisedPrompt = currentOutputImageId ? task.revisedPromptByImage?.[currentOutputImageId]?.trim() : ''
+  const showRevisedPrompt = Boolean(currentRevisedPrompt && currentRevisedPrompt !== task.prompt.trim())
+  const codexCliPromptKey = getCodexCliPromptKey(settings)
+  const hasHandledPromptWarning = settings.codexCli || dismissedCodexCliPrompts.includes(codexCliPromptKey)
+  const showPromptWarning = Boolean(currentOutputImageId && (!currentRevisedPrompt || showRevisedPrompt) && !hasHandledPromptWarning)
+  const aggregateActualParams = outputLen > 0 ? { ...task.actualParams, n: outputLen } : task.actualParams
 
   const formatTime = (ts: number | null) => {
     if (!ts) return ''
@@ -112,6 +170,12 @@ export default function DetailModal() {
   }
 
   const formatDuration = () => {
+    if (task.status === 'running') {
+      const seconds = Math.max(0, Math.floor((now - task.createdAt) / 1000))
+      const mm = String(Math.floor(seconds / 60)).padStart(2, '0')
+      const ss = String(seconds % 60).padStart(2, '0')
+      return `${mm}:${ss}`
+    }
     if (task.elapsed == null) return null
     const seconds = Math.floor(task.elapsed / 1000)
     const mm = String(Math.floor(seconds / 60)).padStart(2, '0')
@@ -129,6 +193,13 @@ export default function DetailModal() {
     setDetailTaskId(null)
   }
 
+  const handleMaskEditCurrentOutput = () => {
+    const imgId = task.outputImages?.[imageIndex]
+    if (!imgId) return
+    setMaskEditorImageId(imgId)
+    setDetailTaskId(null)
+  }
+
   const handleDelete = () => {
     setDetailTaskId(null)
     setConfirmDialog({
@@ -138,45 +209,55 @@ export default function DetailModal() {
     })
   }
 
+  const handleToggleFavorite = () => {
+    updateTaskInStore(task.id, { isFavorite: !task.isFavorite })
+  }
+
   const handleCopyError = async () => {
     const errorText = task.error || '生成失败'
     try {
-      await navigator.clipboard.writeText(errorText)
+      await copyTextToClipboard(errorText)
       showToast('完整报错已复制', 'success')
-    } catch {
-      showToast('复制报错失败', 'error')
+    } catch (err) {
+      showToast(getClipboardFailureMessage('复制报错失败', err), 'error')
     }
   }
 
   const handleCopyPrompt = async () => {
     if (!task.prompt) return
     try {
-      await navigator.clipboard.writeText(task.prompt)
+      await copyTextToClipboard(task.prompt)
       showToast('提示词已复制', 'success')
-    } catch {
-      showToast('复制提示词失败', 'error')
+    } catch (err) {
+      showToast(getClipboardFailureMessage('复制提示词失败', err), 'error')
     }
   }
 
+  const handleShowPromptWarning = () => {
+    showCodexCliPrompt(
+      true,
+      currentRevisedPrompt ? '接口返回的提示词已被改写' : '接口没有返回官方 API 会返回的部分信息',
+    )
+  }
+
   const handleCopyInputImage = async () => {
-    const imgId = task.inputImageIds?.[0]
+    const imgId = allInputImageIds[0]
     const src = imgId ? imageSrcs[imgId] : ''
     if (!src) return
     try {
       const res = await fetch(src)
       const blob = await res.blob()
-      await navigator.clipboard.write([
-        new ClipboardItem({ [blob.type]: blob }),
-      ])
+      await copyBlobToClipboard(blob)
       showToast('参考图已复制', 'success')
     } catch (err) {
       console.error(err)
-      showToast('复制参考图失败', 'error')
+      showToast(getClipboardFailureMessage('复制参考图失败', err), 'error')
     }
   }
 
   return (
     <div
+      data-no-drag-select
       className="fixed inset-0 z-50 flex items-center justify-center p-4"
       onClick={() => setDetailTaskId(null)}
     >
@@ -272,10 +353,18 @@ export default function DetailModal() {
             </>
           )}
           {task.status === 'running' && (
-            <svg className="w-10 h-10 text-blue-400 animate-spin" fill="none" viewBox="0 0 24 24">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-            </svg>
+            <>
+              <div className="absolute left-4 top-4 flex items-center gap-1 bg-black/50 text-white text-xs px-2 py-0.5 rounded backdrop-blur-sm font-mono">
+                <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                {formatDuration()}
+              </div>
+              <svg className="w-10 h-10 text-blue-400 animate-spin" fill="none" viewBox="0 0 24 24">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+              </svg>
+            </>
           )}
           {task.status === 'error' && (
             <div className="w-full max-w-md px-4 text-center">
@@ -336,13 +425,35 @@ export default function DetailModal() {
                   </svg>
                 </button>
               )}
+              {showPromptWarning && (
+                <span className="relative inline-flex">
+                  <button
+                    type="button"
+                    className="p-1 rounded text-amber-500 hover:bg-amber-50 dark:text-yellow-300 dark:hover:bg-yellow-500/10 transition"
+                    onClick={handleShowPromptWarning}
+                    aria-label="提示词已被改写"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v4m0 4h.01M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+                    </svg>
+                  </button>
+                </span>
+              )}
             </div>
             <p className="text-sm text-gray-700 dark:text-gray-300 leading-relaxed whitespace-pre-wrap mb-4">
               {task.prompt || '(无提示词)'}
             </p>
+            {showRevisedPrompt && currentRevisedPrompt && (
+              <div className="mb-4">
+                <ActualValueBadge
+                  value={currentRevisedPrompt}
+                  className="max-w-full rounded px-2 py-1 text-left text-xs leading-relaxed whitespace-pre-wrap"
+                />
+              </div>
+            )}
 
             {/* 参考图 */}
-            {task.inputImageIds?.length > 0 && (
+            {allInputImageIds.length > 0 && (
               <div className="mb-4">
                 <div className="flex items-center gap-1.5 mb-2">
                   <h3 className="text-xs font-medium text-gray-400 dark:text-gray-500 uppercase tracking-wider">
@@ -359,15 +470,31 @@ export default function DetailModal() {
                   </button>
                 </div>
                 <div className="flex gap-2 flex-wrap">
-                  {task.inputImageIds.map((imgId) => (
-                    <img
-                      key={imgId}
-                      src={imageSrcs[imgId] || ''}
-                      className="w-16 h-16 rounded-lg object-cover border border-gray-200 dark:border-white/[0.08] cursor-pointer hover:opacity-80 transition"
-                      onClick={() => setLightboxImageId(imgId, task.inputImageIds)}
-                      alt=""
-                    />
-                  ))}
+                  {allInputImageIds.map((imgId) => {
+                    const isMaskTarget = imgId === maskTargetId
+                    const displaySrc = (isMaskTarget && maskPreviewSrc) ? maskPreviewSrc : (imageSrcs[imgId] || '')
+                    return (
+                      <div key={imgId} className="relative group inline-block">
+                        <div
+                          className={`relative w-16 h-16 rounded-lg overflow-hidden border cursor-pointer hover:opacity-80 transition ${
+                            isMaskTarget ? 'border-blue-500 border-2 shadow-sm' : 'border-gray-200 dark:border-white/[0.08]'
+                          }`}
+                          onClick={() => setLightboxImageId(imgId, allInputImageIds)}
+                        >
+                          <img
+                            src={displaySrc}
+                            className="w-full h-full object-cover"
+                            alt=""
+                          />
+                          {isMaskTarget && (
+                            <span className="absolute left-1 top-1 rounded bg-blue-500/90 px-1.5 py-0.5 text-[8px] leading-none text-white font-bold tracking-wider backdrop-blur-sm z-10 pointer-events-none">
+                              MASK
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    )
+                  })}
                 </div>
               </div>
             )}
@@ -380,35 +507,33 @@ export default function DetailModal() {
               <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2">
                 <span className="text-gray-400 dark:text-gray-500">尺寸</span>
                 <br />
-                <span className="text-gray-700 dark:text-gray-300 font-medium">{task.params.size}</span>
+                <DetailParamValue task={task} paramKey="size" className="font-medium" actualParams={currentActualParams} />
               </div>
               <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2">
                 <span className="text-gray-400 dark:text-gray-500">质量</span>
                 <br />
-                <span className="text-gray-700 dark:text-gray-300 font-medium">{task.params.quality}</span>
+                <DetailParamValue task={task} paramKey="quality" className="font-medium" actualParams={currentActualParams} />
               </div>
               <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2">
                 <span className="text-gray-400 dark:text-gray-500">格式</span>
                 <br />
-                <span className="text-gray-700 dark:text-gray-300 font-medium">{task.params.output_format}</span>
+                <DetailParamValue task={task} paramKey="output_format" className="font-medium" actualParams={currentActualParams} />
               </div>
               <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2">
                 <span className="text-gray-400 dark:text-gray-500">审核</span>
                 <br />
-                <span className="text-gray-700 dark:text-gray-300 font-medium">{task.params.moderation}</span>
+                <DetailParamValue task={task} paramKey="moderation" className="font-medium" actualParams={currentActualParams} />
               </div>
               <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2">
                 <span className="text-gray-400 dark:text-gray-500">数量</span>
                 <br />
-                <span className="text-gray-700 dark:text-gray-300 font-medium">{task.params.n}</span>
+                <DetailParamValue task={task} paramKey="n" className="font-medium" actualParams={aggregateActualParams} />
               </div>
               {task.params.output_compression != null && (
                 <div className="bg-gray-50 dark:bg-white/[0.03] rounded-lg px-3 py-2">
                   <span className="text-gray-400 dark:text-gray-500">压缩率</span>
                   <br />
-                  <span className="text-gray-700 dark:text-gray-300 font-medium">
-                    {task.params.output_compression}
-                  </span>
+                  <DetailParamValue task={task} paramKey="output_compression" className="font-medium" actualParams={currentActualParams} />
                 </div>
               )}
             </div>
@@ -421,10 +546,10 @@ export default function DetailModal() {
           </div>
 
           {/* 操作按钮 */}
-          <div className="flex gap-2 pt-3 border-t border-gray-100 dark:border-white/[0.08]">
+          <div className="grid grid-cols-4 sm:flex gap-2 pt-4 border-t border-gray-100 dark:border-white/[0.08]">
             <button
               onClick={handleReuse}
-              className="flex-1 flex items-center justify-center gap-1.5 px-2 sm:px-3 py-2 rounded-lg bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400 hover:bg-blue-100 dark:hover:bg-blue-500/20 transition text-xs sm:text-sm font-medium whitespace-nowrap"
+              className="col-span-2 sm:flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400 hover:bg-blue-100 dark:hover:bg-blue-500/20 transition text-sm font-medium whitespace-nowrap"
             >
               <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 10h10a8 8 0 018 8v2M3 10l6 6m-6-6l6-6" />
@@ -434,7 +559,7 @@ export default function DetailModal() {
             <button
               onClick={handleEdit}
               disabled={!outputLen}
-              className="flex-1 flex items-center justify-center gap-1.5 px-2 sm:px-3 py-2 rounded-lg bg-green-50 dark:bg-green-500/10 text-green-600 dark:text-green-400 hover:bg-green-100 dark:hover:bg-green-500/20 disabled:opacity-40 disabled:cursor-not-allowed transition text-xs sm:text-sm font-medium whitespace-nowrap"
+              className="col-span-2 sm:flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl bg-green-50 dark:bg-green-500/10 text-green-600 dark:text-green-400 hover:bg-green-100 dark:hover:bg-green-500/20 disabled:opacity-40 disabled:cursor-not-allowed transition text-sm font-medium whitespace-nowrap"
             >
               <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
@@ -443,12 +568,25 @@ export default function DetailModal() {
             </button>
             <button
               onClick={handleDelete}
-              className="flex-1 flex items-center justify-center gap-1.5 px-2 sm:px-3 py-2 rounded-lg bg-red-50 dark:bg-red-500/10 text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-500/20 transition text-xs sm:text-sm font-medium whitespace-nowrap"
+              className="col-span-3 sm:flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl bg-red-50 dark:bg-red-500/10 text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-500/20 transition text-sm font-medium whitespace-nowrap"
             >
               <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
               </svg>
               删除记录
+            </button>
+            <button
+              onClick={handleToggleFavorite}
+              className={`col-span-1 sm:flex-none sm:w-11 w-full flex items-center justify-center rounded-xl transition ${
+                task.isFavorite
+                  ? 'bg-yellow-50 text-yellow-500 hover:bg-yellow-100 dark:bg-yellow-500/10 dark:hover:bg-yellow-500/20'
+                  : 'bg-gray-50 text-gray-400 hover:bg-yellow-50 hover:text-yellow-500 dark:bg-white/[0.04] dark:hover:bg-yellow-500/10'
+              }`}
+              title={task.isFavorite ? '取消收藏' : '收藏记录'}
+            >
+              <svg className="w-5 h-5" fill={task.isFavorite ? 'currentColor' : 'none'} stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.915c.969 0 1.371 1.24.588 1.81l-3.976 2.888a1 1 0 00-.363 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.976-2.888a1 1 0 00-1.176 0l-3.976 2.888c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.363-1.118l-3.976-2.888c-.784-.57-.38-1.81.588-1.81h4.914a1 1 0 00.951-.69l1.519-4.674z" />
+              </svg>
             </button>
           </div>
         </div>
